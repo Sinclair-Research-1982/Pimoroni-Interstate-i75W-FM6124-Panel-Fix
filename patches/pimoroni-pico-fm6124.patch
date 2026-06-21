@@ -1,0 +1,341 @@
+diff --git a/drivers/hub75/hub75.cpp b/drivers/hub75/hub75.cpp
+index b3b2e376..b986ebfa 100644
+--- a/drivers/hub75/hub75.cpp
++++ b/drivers/hub75/hub75.cpp
+@@ -9,7 +9,11 @@
+ namespace pimoroni {
+ 
+ Hub75::Hub75(uint width, uint height, Pixel *buffer, PanelType panel_type, bool inverted_stb, COLOR_ORDER color_order)
+- : width(width), height(height), panel_type(panel_type), inverted_stb(inverted_stb), color_order(color_order)
++ : Hub75(width, height, buffer, panel_type, inverted_stb, color_order, 0, 0, 0) {
++}
++
++Hub75::Hub75(uint width, uint height, Pixel *buffer, PanelType panel_type, bool inverted_stb, COLOR_ORDER color_order, uint dummy_pixels, uint latch_cycles, uint dma_prepend_columns, uint dma_advance_columns, uint dma_prepend_extra_columns)
++ : width(width), height(height), panel_type(panel_type), inverted_stb(inverted_stb), color_order(color_order), dummy_pixels(dummy_pixels), latch_cycles(latch_cycles), dma_prepend_columns(dma_prepend_columns), dma_advance_columns(dma_advance_columns), dma_prepend_extra_columns(dma_prepend_extra_columns)
+  {
+     // Set up allllll the GPIO
+     gpio_init(pin_r0); gpio_set_function(pin_r0, GPIO_FUNC_SIO); gpio_set_dir(pin_r0, true); gpio_put(pin_r0, 0);
+@@ -31,13 +35,46 @@ Hub75::Hub75(uint width, uint height, Pixel *buffer, PanelType panel_type, bool
+     gpio_init(pin_oe); gpio_set_function(pin_oe, GPIO_FUNC_SIO); gpio_set_dir(pin_oe, true); gpio_put(pin_clk, !oe_polarity);
+ 
+     if (buffer == nullptr) {
+-        back_buffer = new Pixel[width * height];
++        managed_back_buffer = new Pixel[width * height + 1]();
++        back_buffer = managed_back_buffer + 1;
+         managed_buffer = true;
+     } else {
+         back_buffer = buffer;
+         managed_buffer = false;
+     }
+ 
++    if (this->dummy_pixels == 0) {
++        this->dummy_pixels = 2;
++    }
++    if (this->latch_cycles == 0) {
++        this->latch_cycles = clock_get_hz(clk_sys) / 4000000;
++    }
++    if (this->dummy_pixels > 16) {
++        this->dummy_pixels = 16;
++    }
++    if (this->latch_cycles > 4096) {
++        this->latch_cycles = 4096;
++    }
++    if (this->dma_prepend_columns > width) {
++        this->dma_prepend_columns = width;
++    }
++    if (this->dma_advance_columns > width) {
++        this->dma_advance_columns = width;
++    }
++    if (this->dma_prepend_extra_columns > width) {
++        this->dma_prepend_extra_columns = width;
++    }
++    if (panel_type == PANEL_FM6124 && this->dma_prepend_columns == 0 && this->dma_advance_columns == 0 && this->dma_prepend_extra_columns == 0) {
++        this->dma_prepend_extra_columns = 1;
++    }
++    dma_transfer_words = width * 2;
++    if (this->dma_prepend_extra_columns > 0) {
++        dma_transfer_words = (width + this->dma_prepend_extra_columns) * 2;
++    }
++    if (this->dma_prepend_columns > 0 || this->dma_advance_columns > 0 || this->dma_prepend_extra_columns > 0) {
++        dma_row_buffer = new Pixel[dma_transfer_words]();
++    }
++
+     if (brightness == 0) {
+ #if PICO_RP2350
+         brightness = 6;
+@@ -141,14 +178,18 @@ void Hub75::FM6126A_setup() {
+     FM6126A_write_register(0b0000001000000000, 13);
+ }
+ 
++void Hub75::FM6124DJ_setup() {
++    // FM6124DJ does not require initialisation - it is a standard serial driver
++}
++
+ void Hub75::start(irq_handler_t handler) {
+     if(handler) {
+         if (panel_type == PANEL_FM6126A) {
+             FM6126A_setup();
++        } else if (panel_type == PANEL_FM6124DJ || panel_type == PANEL_FM6124) {
++            FM6124DJ_setup();
+         }
+ 
+-        uint latch_cycles = clock_get_hz(clk_sys) / 4000000;
+-
+         // Claim the PIO so we can clean it upon soft restart
+         pio_sm_claim(pio, sm_data);
+         pio_sm_claim(pio, sm_row);
+@@ -184,8 +225,7 @@ void Hub75::start(irq_handler_t handler) {
+         bit = 0;
+ 
+         hub75_data_rgb888_set_shift(pio, sm_data, data_prog_offs, bit);
+-        dma_channel_set_trans_count(dma_channel, width * 2, false);
+-        dma_channel_set_read_addr(dma_channel, &back_buffer, true);
++        start_dma_for_row();
+     }
+ }
+ 
+@@ -230,8 +270,9 @@ void Hub75::stop(irq_handler_t handler) {
+ 
+ Hub75::~Hub75() {
+     if (managed_buffer) {
+-        delete[] back_buffer;
++        delete[] managed_back_buffer;
+     }
++    delete[] dma_row_buffer;
+ }
+ 
+ void Hub75::clear() {
+@@ -248,9 +289,10 @@ void Hub75::dma_complete() {
+     if(dma_channel_get_irq0_status(dma_channel)) {
+         dma_channel_acknowledge_irq0(dma_channel);
+ 
+-        // Push out a dummy pixel for each row
+-        pio_sm_put_blocking(pio, sm_data, 0);
+-        pio_sm_put_blocking(pio, sm_data, 0);
++        // Push trailing dummy pixels to clock out the final real column.
++        for (uint i = 0; i < dummy_pixels; i++) {
++            pio_sm_put_blocking(pio, sm_data, 0);
++        }
+ 
+         // SM is finished when it stalls on empty TX FIFO
+         hub75_wait_tx_stall(pio, sm_data);
+@@ -272,11 +314,37 @@ void Hub75::dma_complete() {
+             hub75_data_rgb888_set_shift(pio, sm_data, data_prog_offs, bit);
+         }
+ 
+-        dma_channel_set_trans_count(dma_channel, width * 2, false);
+-        dma_channel_set_read_addr(dma_channel, &back_buffer[row * width * 2], true);
++        start_dma_for_row();
+     }
+ }
+ 
++void Hub75::start_dma_for_row() {
++    Pixel *source = &back_buffer[row * width * 2];
++    Pixel *dma_source = source;
++
++    if (dma_prepend_extra_columns > 0 && dma_row_buffer != nullptr) {
++        uint prepend_words = dma_prepend_extra_columns * 2;
++        std::fill_n(dma_row_buffer, prepend_words, Pixel(0));
++        std::copy_n(source, width * 2, dma_row_buffer + prepend_words);
++        dma_source = dma_row_buffer;
++    } else if (dma_prepend_columns > 0 && dma_row_buffer != nullptr) {
++        uint prepend_words = dma_prepend_columns * 2;
++        uint copy_words = (width - dma_prepend_columns) * 2;
++        std::fill_n(dma_row_buffer, prepend_words, Pixel(0));
++        std::copy_n(source, copy_words, dma_row_buffer + prepend_words);
++        dma_source = dma_row_buffer;
++    } else if (dma_advance_columns > 0 && dma_row_buffer != nullptr) {
++        uint advance_words = dma_advance_columns * 2;
++        uint copy_words = (width - dma_advance_columns) * 2;
++        std::copy_n(source + advance_words, copy_words, dma_row_buffer);
++        std::fill_n(dma_row_buffer + copy_words, advance_words, Pixel(0));
++        dma_source = dma_row_buffer;
++    }
++
++    dma_channel_set_trans_count(dma_channel, dma_transfer_words, false);
++    dma_channel_set_read_addr(dma_channel, dma_source, true);
++}
++
+ void Hub75::copy_to_back_buffer(void *data, size_t len, int start_x, int start_y, int g_width, int g_height) {
+     uint8_t *p = (uint8_t *)data;
+ 
+diff --git a/drivers/hub75/hub75.hpp b/drivers/hub75/hub75.hpp
+index 1354406b..b74d10c9 100644
+--- a/drivers/hub75/hub75.hpp
++++ b/drivers/hub75/hub75.hpp
+@@ -62,6 +62,8 @@ struct Pixel {
+ enum PanelType {
+     PANEL_GENERIC = 0,
+     PANEL_FM6126A,
++    PANEL_FM6124DJ,
++    PANEL_FM6124,
+ };
+ 
+ Pixel hsv_to_rgb(float h, float s, float v);
+@@ -82,6 +84,8 @@ class Hub75 {
+     uint g_shift = 10;
+     uint b_shift = 20;
+     Pixel *back_buffer;
++    Pixel *managed_back_buffer = nullptr;
++    Pixel *dma_row_buffer = nullptr;
+     bool managed_buffer = false;
+     PanelType panel_type;
+     bool inverted_stb = false;
+@@ -101,6 +105,12 @@ class Hub75 {
+     uint row_prog_offs = 0;
+ 
+     uint brightness = 6;
++    uint dummy_pixels = 2;
++    uint latch_cycles = 0;
++    uint dma_prepend_columns = 0;
++    uint dma_advance_columns = 0;
++    uint dma_prepend_extra_columns = 0;
++    uint dma_transfer_words = 0;
+ 
+ 
+     // Top half of display - 16 rows on a 32x32 panel
+@@ -141,10 +151,12 @@ class Hub75 {
+     Hub75(uint width, uint height, Pixel *buffer) : Hub75(width, height, buffer, PANEL_GENERIC) {};
+     Hub75(uint width, uint height, Pixel *buffer, PanelType panel_type) : Hub75(width, height, buffer, panel_type, false) {};
+     Hub75(uint width, uint height, Pixel *buffer, PanelType panel_type, bool inverted_stb, COLOR_ORDER color_order=COLOR_ORDER::RGB);
++    Hub75(uint width, uint height, Pixel *buffer, PanelType panel_type, bool inverted_stb, COLOR_ORDER color_order, uint dummy_pixels, uint latch_cycles, uint dma_prepend_columns, uint dma_advance_columns = 0, uint dma_prepend_extra_columns = 0);
+     ~Hub75();
+ 
+     void FM6126A_write_register(uint16_t value, uint8_t position);
+     void FM6126A_setup();
++    void FM6124DJ_setup();
+     void set_color(uint x, uint y, Pixel c);
+ 
+     void set_pixel(uint x, uint y, uint8_t r, uint8_t g, uint8_t b);
+@@ -154,6 +166,7 @@ class Hub75 {
+     void start(irq_handler_t handler);
+     void stop(irq_handler_t handler);
+     void dma_complete();
++    void start_dma_for_row();
+     void update(PicoGraphics *graphics);
+     };
+-}
+\ No newline at end of file
++}
+diff --git a/micropython/modules/hub75/hub75.c b/micropython/modules/hub75/hub75.c
+index 50781df8..12576959 100644
+--- a/micropython/modules/hub75/hub75.c
++++ b/micropython/modules/hub75/hub75.c
+@@ -49,6 +49,8 @@ static const mp_map_elem_t hub75_globals_table[] = {
+     { MP_OBJ_NEW_QSTR(MP_QSTR_Hub75), (mp_obj_t)&Hub75_type },
+     { MP_ROM_QSTR(MP_QSTR_PANEL_GENERIC), MP_ROM_INT(0) },
+     { MP_ROM_QSTR(MP_QSTR_PANEL_FM6126A), MP_ROM_INT(1) },
++    { MP_ROM_QSTR(MP_QSTR_PANEL_FM6124DJ), MP_ROM_INT(2) },
++    { MP_ROM_QSTR(MP_QSTR_PANEL_FM6124), MP_ROM_INT(3) },
+     { MP_ROM_QSTR(MP_QSTR_BUTTON_A), MP_ROM_INT(14) },
+     { MP_ROM_QSTR(MP_QSTR_BUTTON_USER), MP_ROM_INT(23) },
+     { MP_ROM_QSTR(MP_QSTR_LED_R), MP_ROM_INT(16) },
+@@ -80,4 +82,4 @@ const mp_obj_module_t hub75_user_cmodule = {
+ MP_REGISTER_MODULE(MP_QSTR_hub75, hub75_user_cmodule, MODULE_HUB75_ENABLED);
+ #else
+ MP_REGISTER_MODULE(MP_QSTR_hub75, hub75_user_cmodule);
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/micropython/modules/hub75/hub75.cpp b/micropython/modules/hub75/hub75.cpp
+index c57db400..adc9f039 100644
+--- a/micropython/modules/hub75/hub75.cpp
++++ b/micropython/modules/hub75/hub75.cpp
+@@ -65,6 +65,12 @@ void Hub75_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind
+         case PANEL_FM6126A:
+             mp_print_str(print, ", panel: fm6126a ");
+             break;
++        case PANEL_FM6124DJ:
++            mp_print_str(print, ", panel: fm6124dj ");
++            break;
++        case PANEL_FM6124:
++            mp_print_str(print, ", panel: fm6124 ");
++            break;
+     }
+ 
+     mp_print_str(print, " )");
+@@ -86,7 +92,12 @@ mp_obj_t Hub75_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, c
+         ARG_buffer,
+         ARG_panel_type,
+         ARG_stb_invert,
+-        ARG_color_order
++        ARG_color_order,
++        ARG_dummy_pixels,
++        ARG_latch_cycles,
++        ARG_dma_prepend_columns,
++        ARG_dma_advance_columns,
++        ARG_dma_prepend_extra_columns
+     };
+     static const mp_arg_t allowed_args[] = {
+         { MP_QSTR_width, MP_ARG_REQUIRED | MP_ARG_INT },
+@@ -95,6 +106,11 @@ mp_obj_t Hub75_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, c
+         { MP_QSTR_panel_type, MP_ARG_INT, {.u_int = 0} },
+         { MP_QSTR_stb_invert, MP_ARG_INT, {.u_int = 0} },
+         { MP_QSTR_color_order, MP_ARG_INT, {.u_int = (uint8_t)Hub75::COLOR_ORDER::RGB} },
++        { MP_QSTR_dummy_pixels, MP_ARG_INT, {.u_int = 0} },
++        { MP_QSTR_latch_cycles, MP_ARG_INT, {.u_int = 0} },
++        { MP_QSTR_dma_prepend_columns, MP_ARG_INT, {.u_int = 0} },
++        { MP_QSTR_dma_advance_columns, MP_ARG_INT, {.u_int = 0} },
++        { MP_QSTR_dma_prepend_extra_columns, MP_ARG_INT, {.u_int = 0} },
+     };
+ 
+     // Parse args.
+@@ -106,6 +122,11 @@ mp_obj_t Hub75_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, c
+     PanelType paneltype = (PanelType)args[ARG_panel_type].u_int;
+     bool stb_invert = args[ARG_stb_invert].u_int;
+     Hub75::COLOR_ORDER color_order = (Hub75::COLOR_ORDER)args[ARG_color_order].u_int;
++    uint dummy_pixels = args[ARG_dummy_pixels].u_int;
++    uint latch_cycles = args[ARG_latch_cycles].u_int;
++    uint dma_prepend_columns = args[ARG_dma_prepend_columns].u_int;
++    uint dma_advance_columns = args[ARG_dma_advance_columns].u_int;
++    uint dma_prepend_extra_columns = args[ARG_dma_prepend_extra_columns].u_int;
+ 
+     Pixel *buffer = nullptr;
+ 
+@@ -122,7 +143,7 @@ mp_obj_t Hub75_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, c
+ 
+     hub75_obj = mp_obj_malloc_with_finaliser(_Hub75_obj_t, &Hub75_type);
+     hub75_obj->buf = buffer;
+-    hub75_obj->hub75 = m_new_class(Hub75, width, height, buffer, paneltype, stb_invert, color_order);
++    hub75_obj->hub75 = m_new_class(Hub75, width, height, buffer, paneltype, stb_invert, color_order, dummy_pixels, latch_cycles, dma_prepend_columns, dma_advance_columns, dma_prepend_extra_columns);
+ 
+     return MP_OBJ_FROM_PTR(hub75_obj);
+ }
+@@ -181,4 +202,4 @@ mp_obj_t Hub75_set_pixel(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_a
+     return mp_const_none;
+ }
+ 
+-}
+\ No newline at end of file
++}
+diff --git a/micropython/modules_py/interstate75.py b/micropython/modules_py/interstate75.py
+index 55b99431..3d5d50a9 100644
+--- a/micropython/modules_py/interstate75.py
++++ b/micropython/modules_py/interstate75.py
+@@ -33,6 +33,8 @@ class Interstate75:
+ 
+     PANEL_GENERIC = hub75.PANEL_GENERIC
+     PANEL_FM6126A = hub75.PANEL_FM6126A
++    PANEL_FM6124DJ = hub75.PANEL_FM6124DJ
++    PANEL_FM6124 = hub75.PANEL_FM6124
+     COLOR_ORDER_RGB = hub75.COLOR_ORDER_RGB
+     COLOR_ORDER_RBG = hub75.COLOR_ORDER_RBG
+     COLOR_ORDER_GRB = hub75.COLOR_ORDER_GRB
+@@ -43,7 +45,7 @@ class Interstate75:
+     # Count Constants
+     NUM_SWITCHES = 2
+ 
+-    def __init__(self, display, panel_type=hub75.PANEL_GENERIC, stb_invert=False, color_order=hub75.COLOR_ORDER_RGB):
++    def __init__(self, display, panel_type=hub75.PANEL_GENERIC, stb_invert=False, color_order=hub75.COLOR_ORDER_RGB, dummy_pixels=0, latch_cycles=0, dma_prepend_columns=0, dma_advance_columns=0, dma_prepend_extra_columns=0):
+         self.interstate75w = "Pico W" in sys.implementation._machine  # noqa: SLF001
+         self.display = PicoGraphics(display=display)
+         self.width, self.height = self.display.get_bounds()
+@@ -55,7 +57,7 @@ class Interstate75:
+             out_width = 256
+             out_height = 64
+ 
+-        self.hub75 = hub75.Hub75(out_width, out_height, panel_type=panel_type, stb_invert=stb_invert, color_order=color_order)
++        self.hub75 = hub75.Hub75(out_width, out_height, panel_type=panel_type, stb_invert=stb_invert, color_order=color_order, dummy_pixels=dummy_pixels, latch_cycles=latch_cycles, dma_prepend_columns=dma_prepend_columns, dma_advance_columns=dma_advance_columns, dma_prepend_extra_columns=dma_prepend_extra_columns)
+         self.hub75.start()
+         if self.interstate75w:
+             self._switch_pins = self.SWITCH_PINS_W

@@ -1,0 +1,31 @@
+diff --git a/modules/rp2350/interstate75.py b/modules/rp2350/interstate75.py
+index dfffae0..48d3dd9 100644
+--- a/modules/rp2350/interstate75.py
++++ b/modules/rp2350/interstate75.py
+@@ -30,6 +30,8 @@ class Interstate75:
+ 
+     PANEL_GENERIC = hub75.PANEL_GENERIC
+     PANEL_FM6126A = hub75.PANEL_FM6126A
++    PANEL_FM6124 = hub75.PANEL_FM6124
++    PANEL_FM6124DJ = hub75.PANEL_FM6124DJ
+     COLOR_ORDER_RGB = hub75.COLOR_ORDER_RGB
+     COLOR_ORDER_RBG = hub75.COLOR_ORDER_RBG
+     COLOR_ORDER_GRB = hub75.COLOR_ORDER_GRB
+@@ -40,7 +42,7 @@ class Interstate75:
+     # Count Constants
+     NUM_SWITCHES = 3
+ 
+-    def __init__(self, display, panel_type=hub75.PANEL_GENERIC, stb_invert=False, color_order=hub75.COLOR_ORDER_RGB, pen_type=PEN_RGB888):
++    def __init__(self, display, panel_type=hub75.PANEL_GENERIC, stb_invert=False, color_order=hub75.COLOR_ORDER_RGB, pen_type=PEN_RGB888, dummy_pixels=0, latch_cycles=0, dma_prepend_columns=0, dma_advance_columns=0, dma_prepend_extra_columns=0):
+         self.display = PicoGraphics(display=display, pen_type=pen_type)
+         self.width, self.height = self.display.get_bounds()
+ 
+@@ -51,7 +53,7 @@ class Interstate75:
+             out_width = 256
+             out_height = 64
+ 
+-        self.hub75 = hub75.Hub75(out_width, out_height, panel_type=panel_type, stb_invert=stb_invert, color_order=color_order)
++        self.hub75 = hub75.Hub75(out_width, out_height, panel_type=panel_type, stb_invert=stb_invert, color_order=color_order, dummy_pixels=dummy_pixels, latch_cycles=latch_cycles, dma_prepend_columns=dma_prepend_columns, dma_advance_columns=dma_advance_columns, dma_prepend_extra_columns=dma_prepend_extra_columns)
+         self.hub75.start()
+         self._switch_pins = self.SWITCH_PINS
+ 
