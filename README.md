@@ -1,6 +1,6 @@
 # Interstate 75 W FM6124 HUB75 Firmware Fix
 
-This repository packages a local firmware fix for Pimoroni Interstate 75 W RP2350 boards driving HUB75 LED matrix panels that use FM6124-style shift register drivers.
+This repository packages a local firmware fix for Pimoroni Interstate 75 W RP2350 boards driving HUB75 LED matrix panels that use FM6124-style shift register drivers. Panels with FM6124 Shift Registers like the ones I have (https://docs.waveshare.com/RGB-Matrix-Px-64x64#specifications) are not supported by Pimoroni's Firmware, as a result the far right column remained unlit. To fix this I had to create a modified Firmware package.
 
 The fix was developed against local checkouts of:
 
@@ -114,3 +114,9 @@ See [TECHNICAL_DETAILS.md](TECHNICAL_DETAILS.md) for the full explanation, inclu
 ## Status
 
 This is a local working fix packaged for other users to test. It is not an official Pimoroni release.
+
+## Disclaimer
+
+This firmware is provided as-is, with no warranty or guarantee of compatibility. Although it worked for my specific Interstate75W and Waveshare FM6124 1/32 scan panel setup, it may not work correctly on other boards, panel revisions, or hardware combinations.
+
+By downloading, flashing, or using this firmware, you accept full responsibility for any outcome. I am not responsible for any hardware damage, display faults, instability, misconfiguration, data loss, or other issues arising from its use.
